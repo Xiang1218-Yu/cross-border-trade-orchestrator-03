@@ -46,6 +46,13 @@ function emit(tenantId: string, topic: string, aggregateId: string, payload: unk
 function mutate(tenantId: string, actor: string, action: string, type: string, entityId: string, before: unknown, after: unknown, topic: string) { record(tenantId, actor, action, type, entityId, before, after); emit(tenantId, topic, entityId, after); }
 function transition(order: Order, next: OrderStatus) { const allowed: Record<OrderStatus, OrderStatus[]> = { draft: ['confirmed', 'cancelled'], confirmed: ['allocated', 'cancelled'], allocated: ['dispatched', 'cancelled'], dispatched: ['delivered'], delivered: ['closed'], closed: [], cancelled: [] }; if (!allowed[order.status].includes(next)) throw new Error(`订单不能从 ${order.status} 变更为 ${next}`); order.status = next; order.version += 1; order.updatedAt = now(); }
 
+// 海关申报状态迁移边界：
+// 提交 draft→submitted；查验 submitted→inspection；放行 submitted/inspection→cleared；
+// 退回 submitted/inspection→rejected；补件后重报 rejected→submitted。
+// cleared 为终态，不存在任何迁出路径。
+export const CUSTOMS_STATUS_TRANSITIONS: Record<CustomsStatus, CustomsStatus[]> = { draft: ['submitted'], submitted: ['inspection', 'cleared', 'rejected'], inspection: ['cleared', 'rejected'], rejected: ['submitted'], cleared: [] };
+const CUSTOMS_STATUSES = Object.keys(CUSTOMS_STATUS_TRANSITIONS) as CustomsStatus[];
+
 export function listOrders(tenantId: string, filters: { status?: string; customerId?: string; q?: string } = {}) { tenant(tenantId); return state.orders.filter(item => item.tenantId === tenantId && (!filters.status || item.status === filters.status) && (!filters.customerId || item.customerId === filters.customerId) && (!filters.q || `${item.reference} ${item.destination}`.toLowerCase().includes(filters.q.toLowerCase()))).map(clone); }
 export function getOrder(tenantId: string, orderId: string) { return clone(orderFor(tenantId, orderId)); }
 export function createOrder(tenantId: string, input: Partial<Order>, actor = 'system') {
@@ -63,7 +70,54 @@ export function closeOrder(tenantId: string, orderId: string, actor = 'system') 
 export function cancelOrder(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const before = clone(order); if (['dispatched', 'delivered', 'closed'].includes(order.status)) throw new Error('已出运订单不能取消'); transition(order, 'cancelled'); state.reservations.filter(item => item.orderId === orderId && item.status === 'active').forEach(item => { state.inventory.find(lot => lot.id === item.lotId)!.reserved -= item.quantity; item.status = 'released'; }); const customer = customerFor(tenantId, order.customerId); if (before.status !== 'draft') customer.creditUsed = money(Math.max(0, customer.creditUsed - order.totalAmount)); mutate(tenantId, actor, 'order.cancelled', 'order', order.id, before, order, 'order.cancelled'); return clone(order); }
 
 export function createCustomsDeclaration(tenantId: string, input: { orderId: string; country?: string; requiredDocuments?: string[] }, actor = 'system') { const order = orderFor(tenantId, input.orderId); if (state.customs.some(item => item.orderId === order.id)) throw new Error('订单已有海关申报'); const declaration: CustomsDeclaration = { id: id('CUS'), tenantId, orderId: order.id, country: input.country ?? order.destination, status: 'draft', documentRefs: [], requiredDocuments: input.requiredDocuments ?? ['commercial-invoice', 'packing-list', 'origin-certificate'], riskScore: order.priority === 'critical' ? 82 : order.totalWeightKg > 1000 ? 60 : 24, updatedAt: now() }; state.customs.push(declaration); order.customsDeclarationId = declaration.id; mutate(tenantId, actor, 'customs.created', 'customs', declaration.id, undefined, declaration, 'customs.created'); return clone(declaration); }
-export function updateCustoms(tenantId: string, declarationId: string, input: { status?: CustomsStatus; documentRefs?: string[]; rejectionReason?: string }, actor = 'system') { const declaration = assertTenant(state.customs.find(item => item.id === declarationId) ?? (() => { throw new Error('海关申报不存在'); })(), tenantId); const before = clone(declaration); if (input.documentRefs) declaration.documentRefs = [...new Set(input.documentRefs)]; if (input.status) { if (input.status === 'cleared' && declaration.requiredDocuments.some(doc => !declaration.documentRefs.includes(doc))) throw new Error('放行前必须补齐所有必需单证'); if (input.status === 'inspection' && declaration.status !== 'submitted') throw new Error('只有已提交申报才能进入查验'); declaration.status = input.status; } declaration.rejectionReason = input.rejectionReason; declaration.updatedAt = now(); mutate(tenantId, actor, 'customs.updated', 'customs', declaration.id, before, declaration, 'customs.updated'); return clone(declaration); }
+export function updateCustoms(tenantId: string, declarationId: string, input: { status?: CustomsStatus; documentRefs?: string[]; rejectionReason?: string }, actor = 'system') {
+  const declaration = state.customs.find(item => item.id === declarationId);
+  if (!declaration) throw new Error('海关申报不存在');
+  assertTenant(declaration, tenantId);
+
+  const shipped = state.shipments.some(item => item.orderId === declaration.orderId);
+
+  // ---- 纯校验阶段：所有入参和迁移规则先在局部变量上验证，任何失败都不触碰 documentRefs / 状态 ----
+  const nextDocumentRefs = input.documentRefs ? [...new Set(input.documentRefs.map(ref => String(ref).trim()).filter(Boolean))] : declaration.documentRefs;
+  const nextStatus = input.status ?? declaration.status;
+  if (input.status !== undefined && !CUSTOMS_STATUSES.includes(input.status)) throw new Error('不支持的海关申报状态');
+
+  const statusChanges = input.status !== undefined && input.status !== declaration.status;
+  const docsChange = input.documentRefs !== undefined && nextDocumentRefs.join('|') !== declaration.documentRefs.join('|');
+  let reasonChanges = input.rejectionReason !== undefined && input.rejectionReason !== declaration.rejectionReason;
+
+  if (input.status !== undefined && input.status !== 'rejected' && input.rejectionReason !== undefined) throw new Error('只有退回状态才能填写退回原因');
+
+  // 已放行（终态）以及已出运（运输事实成立）的记录整体不可逆，重复提交当前状态属幂等 no-op
+  if (statusChanges || docsChange || reasonChanges) {
+    if (declaration.status === 'cleared') throw new Error(`海关申报已放行${shipped ? '且订单已出运' : ''}，状态与单证不可变更`);
+    if (shipped) throw new Error('订单已出运，海关申报记录已锁定');
+  }
+
+  if (statusChanges) {
+    if (!CUSTOMS_STATUS_TRANSITIONS[declaration.status].includes(nextStatus)) throw new Error(`海关申报不能从 ${declaration.status} 变更为 ${nextStatus}`);
+    if (nextStatus === 'rejected' && (!input.rejectionReason || !String(input.rejectionReason).trim())) throw new Error('退回申报必须填写退回原因');
+    if (nextStatus === 'cleared' && declaration.requiredDocuments.some(doc => !nextDocumentRefs.includes(doc))) throw new Error('放行前必须补齐所有必需单证');
+  }
+
+  // rejected→submitted（补件重报）时清除历史退回原因；拒绝或通过时按入参记录原因
+  let nextRejectionReason = declaration.rejectionReason;
+  if (statusChanges) nextRejectionReason = nextStatus === 'rejected' ? input.rejectionReason : undefined;
+  else if (input.rejectionReason !== undefined) nextRejectionReason = input.rejectionReason;
+  reasonChanges = nextRejectionReason !== declaration.rejectionReason;
+
+  // 幂等：重复更新（当前状态 + 无实际差异）直接返回，不写 audit / outbox
+  if (!statusChanges && !docsChange && !reasonChanges) return clone(declaration);
+
+  // ---- 单一提交点：校验全部通过后才落库并记录 audit / outbox ----
+  const before = clone(declaration);
+  declaration.status = nextStatus;
+  declaration.documentRefs = nextDocumentRefs;
+  declaration.rejectionReason = nextRejectionReason;
+  declaration.updatedAt = now();
+  mutate(tenantId, actor, 'customs.updated', 'customs', declaration.id, before, declaration, 'customs.updated');
+  return clone(declaration);
+}
 export function addShipmentEvent(tenantId: string, shipmentId: string, input: { code: string; location: string; occurredAt?: string; note?: string }, actor = 'system') { const shipment = assertTenant(state.shipments.find(item => item.id === shipmentId) ?? (() => { throw new Error('运输单不存在'); })(), tenantId); if (!input.code || !input.location) throw new Error('轨迹编码和位置不能为空'); const event = { id: id('TRK'), code: input.code, location: input.location, occurredAt: input.occurredAt ?? now(), note: input.note }; shipment.events.push(event); shipment.currentLocation = input.location; if (input.code === 'DEPARTED') { shipment.status = 'in_transit'; shipment.legs[0].status = 'in_transit'; } if (input.code === 'DELAYED') { shipment.status = 'exception'; shipment.legs.find(leg => leg.status !== 'arrived')!.status = 'delayed'; createApproval(tenantId, { orderId: shipment.orderId, type: 'delay_compensation', reason: `运输轨迹 ${shipment.trackingNo} 发生延误` }, actor); } if (input.code === 'ARRIVED') shipment.legs[shipment.legs.length - 1].status = 'arrived'; record(tenantId, actor, 'shipment.event.added', 'shipment', shipment.id, undefined, event); emit(tenantId, 'shipment.event.added', shipment.id, event); return clone(shipment); }
 
 export function generateInvoice(tenantId: string, orderId: string, actor = 'system') { const order = orderFor(tenantId, orderId); const existing = state.invoices.find(item => item.orderId === orderId); if (existing) return clone(existing); if (!['allocated', 'dispatched', 'delivered', 'closed'].includes(order.status)) throw new Error('订单完成库存分配后才能开票'); const freight = money(Math.max(120, order.totalWeightKg * (order.priority === 'critical' ? 4.2 : 2.1))); const fuel = money(freight * 0.13); const customsFee = money(95 + order.items.length * 25); const lines: InvoiceLine[] = [{ code: 'GOODS', description: '货物服务费', quantity: 1, unitPrice: order.subtotal, amount: order.subtotal }, { code: 'FREIGHT', description: '跨境运输费', quantity: 1, unitPrice: freight, amount: freight }, { code: 'FUEL', description: '燃油附加费', quantity: 1, unitPrice: fuel, amount: fuel }, { code: 'CUSTOMS', description: '关务服务费', quantity: 1, unitPrice: customsFee, amount: customsFee }]; const subtotal = money(lines.reduce((sum, line) => sum + line.amount, 0)); const tax = money(subtotal * 0.06); const invoice: Invoice = { id: id('INV'), tenantId, orderId, number: `INV-${new Date().getFullYear()}-${String(state.invoices.length + 1).padStart(5, '0')}`, status: 'issued', currency: order.currency, lines, subtotal, tax, total: money(subtotal + tax), paid: 0, dueDate: new Date(Date.now() + 30 * 86400000).toISOString(), createdAt: now() }; state.invoices.push(invoice); order.invoiceId = invoice.id; mutate(tenantId, actor, 'invoice.issued', 'invoice', invoice.id, undefined, invoice, 'invoice.issued'); return clone(invoice); }
